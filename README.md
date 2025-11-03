@@ -31,3 +31,7 @@ The script is designed to run in the background forever. For example, you can st
 ```bash
 node app.js
 ```
+
+## Autostart
+
+Place the `wallpaper-sync.desktop` file in your `~/.config/autostart/` directory to have it start automatically on login.
