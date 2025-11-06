@@ -1,77 +1,117 @@
-# Wallpaper Sync Script
+# Wallpaper Sync
 
-This Node.js script automatically syncs wallpapers across devices via Dropbox. When you set a wallpaper on any device, it gets copied to Dropbox and applied on all other devices automatically.
-
-## Directory Structure
-
-```
-/home/martins/Dropbox/Photos/wallpaper/
-├── nov-16-moonlight-bats-nocal-1920x1200.png
-├── wallpaper-2025-11-04T15-30-00-000Z.jpg
-└── wallpaper.txt   ← list of all wallpapers that have already been synced
-
-~/.local/state/wallpaper-sync/
-├── debug.log                    ← detailed sync activity logs
-└── last-script-wallpaper.txt    ← tracks script vs user changes
-```
+A simple Node.js application that automatically syncs wallpapers across multiple Linux/GNOME computers using Dropbox.
 
 ## How It Works
 
-### Bidirectional Sync
-Every 10 minutes, the script performs two types of sync:
+The app monitors your GNOME wallpaper changes and syncs them across all your computers by storing wallpapers in a shared Dropbox folder. When you change your wallpaper on one computer, it automatically appears on all your other computers running this app.
 
-#### 1. Local → Dropbox (Upload Changes)
-1. **Detect User Changes**: Checks if you manually changed your wallpaper
-2. **Smart Upload**: Only syncs wallpapers changed by users (not by the script itself)
-3. **Copy to Dropbox**: Copies new user-set wallpapers to the Dropbox folder with timestamps
-4. **Track**: Marks the wallpaper as synced in `wallpaper.txt`
+### Core Functionality
 
-#### 2. Dropbox → Local (Download Changes)
-1. **Check for New Files**: Looks for new images in Dropbox that aren't in `wallpaper.txt`
-2. **Apply Newest**: Sets the most recent new wallpaper as your current wallpaper
-3. **Update State**: Tracks that this wallpaper was set by the script (to prevent re-uploading)
+1. **Local Wallpaper Monitoring**: Watches the GNOME background file (`~/.config/background`) for changes
+2. **Dropbox Upload**: When a wallpaper changes, copies it to `~/Dropbox/Photos/wallpaper/` with a timestamp
+3. **Remote Wallpaper Detection**: Monitors the Dropbox wallpaper folder for new files from other computers
+4. **Automatic Wallpaper Setting**: Sets new wallpapers from Dropbox as your GNOME background
+5. **Duplicate Prevention**: Tracks handled wallpapers to avoid infinite loops
 
-### Race Condition Prevention
-The script intelligently distinguishes between:
-- **User changes**: When you manually set a wallpaper → Gets synced to Dropbox
-- **Script changes**: When the script applies a wallpaper from Dropbox → Doesn't get re-synced
+## Prerequisites
 
-This prevents devices from fighting over which wallpaper should be active.
+- Linux with GNOME desktop environment
+- Node.js (version 14 or higher)
+- Dropbox installed and synced
+- `gsettings` command available (standard on GNOME)
 
-## The Workflow
+## Installation
 
-1. Set any image as wallpaper on **Device A** 
-2. Within 10 minutes, the script copies it to Dropbox
-3. **Device B** detects the new wallpaper and applies it automatically
-4. **Device C** also gets the same wallpaper automatically
-5. All devices stay in sync without conflicts!
+1. Clone or download this repository to your desired location:
+   ```bash
+   cd ~/Programming
+   git clone <repository-url> wallpaper-sync
+   cd wallpaper-sync
+   ```
+
+2. Install dependencies:
+   ```bash
+   npm install
+   ```
+
+3. Ensure your Dropbox is set up and syncing. The app will create the wallpaper folder at:
+   ```
+   ~/Dropbox/Photos/wallpaper/
+   ```
+
+4. Test the application:
+   ```bash
+   npm start
+   ```
+
+## Automatic Startup
+
+To have the app start automatically when you log in:
+
+1. Copy the provided `.desktop` file to your autostart directory:
+   ```bash
+   cp wallpaper-sync.desktop ~/.config/autostart/
+   ```
+
+2. Edit the `.desktop` file to match your Node.js and app installation paths:
+   ```bash
+   nano ~/.config/autostart/wallpaper-sync.desktop
+   ```
+
+3. Update the `Exec` line with your correct paths:
+   ```
+   Exec=/path/to/node /path/to/wallpaper-sync/app.js
+   ```
+
+## Configuration
+
+The app automatically creates configuration files in standard Linux locations:
+
+- **Config**: `~/.config/wallpaper-sync/config.json` - Tracks handled wallpapers
+- **Logs**: `~/.local/state/wallpaper-sync/debug.log` - Application logs (max 1MB, rotated)
+
+No manual configuration is required.
 
 ## Usage
 
-The script is designed to run in the background forever. Run this on every device where you want the wallpaper to sync:
+1. **Start the app** on all computers where you want wallpaper sync
+2. **Change your wallpaper** on any computer using GNOME settings or any wallpaper app
+3. **Wait a few seconds** - the wallpaper should automatically appear on your other computers
 
-```bash
-node app.js
-```
+The app runs silently in the background and logs its activity to both the console and log file.
 
-### Logging
-- Detailed logs are written to `~/.local/state/wallpaper-sync/debug.log`
-- Logs are automatically rotated to keep the last 1000 lines
-- All activity is also printed to the console
+## File Locations
 
-### Requirements
-- **Node.js** (ESM modules supported)
-- **GNOME Desktop** (uses `gsettings` for wallpaper management)
-- **Dropbox** sync folder configured
-- **Linux** environment
-
-## Autostart
-
-Place the `wallpaper-sync.desktop` file in your `~/.config/autostart/` directory to have it start automatically on login.
+- **GNOME Background**: `~/.config/background`
+- **Dropbox Wallpapers**: `~/Dropbox/Photos/wallpaper/`
+- **App Config**: `~/.config/wallpaper-sync/config.json`
+- **App Logs**: `~/.local/state/wallpaper-sync/debug.log`
 
 ## Troubleshooting
 
-- **Check logs**: `tail -f ~/.local/state/wallpaper-sync/debug.log`
-- **Verify Dropbox**: Ensure `/home/martins/Dropbox/Photos/wallpaper/` exists and is syncing
-- **Test manually**: Change wallpaper and check if it appears in Dropbox within 10 minutes
-- **Multiple devices**: Make sure the script is running on all devices you want to sync
+### App Not Starting
+- Check Node.js is installed: `node --version`
+- Verify dependencies: `npm install`
+- Check logs in `~/.local/state/wallpaper-sync/debug.log`
+
+### Wallpapers Not Syncing
+- Ensure Dropbox is running and synced
+- Check the Dropbox wallpaper folder exists: `~/Dropbox/Photos/wallpaper/`
+- Verify GNOME is setting wallpapers: Test with `gsettings set org.gnome.desktop.background picture-uri file:///path/to/image`
+
+### Multiple Computers
+- Install and run the app on ALL computers where you want sync
+- Ensure all computers have access to the same Dropbox account
+- Each computer maintains its own config file to prevent conflicts
+
+## Technical Details
+
+- **Language**: Modern JavaScript (ES6+)
+- **Dependencies**: chokidar (file watching), winston (logging)
+- **File Watching**: Uses Linux inotify system via chokidar
+- **Wallpaper Format**: Files stored as `wallpaper-YYYY-MM-DDTHH-MM-SS` (ISO datetime)
+- **Debouncing**: 2-second delay to batch rapid file changes
+- **Error Handling**: Resilient operation with retry logic and error recovery
+
+The app is designed to be lightweight, reliable, and run continuously in the background without user intervention.

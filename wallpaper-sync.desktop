@@ -1,8 +1,10 @@
 [Desktop Entry]
 Name=Wallpaper Sync
-Comment=Wallpaper Sync
+Comment=Sync wallpapers across multiple Linux computers using Dropbox
 Exec=/home/martins/.nvm/versions/node/v22.17.1/bin/node /home/martins/Programming/wallpaper-sync/app.js
 Terminal=false
 Type=Application
 Categories=Utility;
 X-GNOME-Autostart-enabled=true
+StartupNotify=false
+Hidden=false

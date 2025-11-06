@@ -1,330 +1,555 @@
 /**
- * Wallpaper Sync Script
+ * Wallpaper Sync
+ * Sync wallpapers across multiple Linux/GNOME computers using Dropbox
  * 
- * This Node.js script automatically syncs wallpapers across devices via Dropbox.
- * When you set a wallpaper on any device, it gets copied to Dropbox and applied
- * on all other devices automatically.
- *
- * Folder structure:
- *   /home/martins/Dropbox/Photos/wallpaper/
- *     ├── nov-16-moonlight-bats-nocal-1920x1200.png
- *     ├── some-other-wallpaper.jpg
- *     └── wallpaper.txt   ← list of all wallpapers that have already been synced
- *
- * How it works:
- * 1. Every 10 minutes, the script checks what your current GNOME wallpaper is.
- * 2. If the current wallpaper isn't in the Dropbox folder or wallpaper.txt, 
- *    it copies the wallpaper to Dropbox and adds it to the list.
- * 3. It also checks for new wallpapers in Dropbox that aren't in wallpaper.txt.
- * 4. If found, it sets that wallpaper locally and marks it as handled.
- * 5. This creates a sync loop: set wallpaper on one device → copies to Dropbox 
- *    → other devices detect and apply it automatically.
- *
- * The workflow: Just set any image as wallpaper on any device, and within 10 minutes
- * all your other devices will have the same wallpaper automatically.
- *
- * Run in background forever with: node app.js
- *
- * Author: Martins Zeltins
- * Environment: Linux (GNOME)
- * Language: Modern JavaScript (ESM)
+ * This application monitors wallpaper changes on GNOME desktop and syncs them
+ * across all computers by storing wallpapers in a Dropbox folder.
  */
 
-import fs from 'fs/promises'
-import path from 'path'
-import { exec } from 'child_process'
-import { promisify } from 'util'
 import os from 'os'
+import fs from 'fs'
+import path from 'path'
+import winston from 'winston'
+import chokidar from 'chokidar'
+import { spawn } from 'child_process'
 
-const runCommand = promisify(exec)
+const HOME_DIR = os.homedir()
+const GNOME_CONFIG_DIR = path.join(HOME_DIR, '.config')
+const GNOME_BACKGROUND_FILE = path.join(GNOME_CONFIG_DIR, 'background')
+const DROPBOX_WALLPAPER_DIR = path.join(HOME_DIR, 'Dropbox', 'Photos', 'wallpaper')
+const APP_CONFIG_DIR = path.join(HOME_DIR, '.config', 'wallpaper-sync')
+const APP_LOG_DIR = path.join(HOME_DIR, '.local', 'state', 'wallpaper-sync')
+const CONFIG_FILE = path.join(APP_CONFIG_DIR, 'config.json')
+const LOG_FILE = path.join(APP_LOG_DIR, 'debug.log')
 
-// Logging configuration
-const appDataDir = path.join(os.homedir(), '.local', 'state', 'wallpaper-sync')
-const logFile = path.join(appDataDir, 'debug.log')
-const maxLogLines = 1000
+const DEBOUNCE_DELAY = 2000
 
-// Path configuration
-const wallpaperDirectory = '/home/martins/Dropbox/Photos/wallpaper'
-const wallpaperListFile = `${wallpaperDirectory}/wallpaper.txt`
-const stateFile = path.join(appDataDir, 'last-script-wallpaper.txt')
+let logger
+let debounceTimeouts = new Map()
 
-// How often to check (in milliseconds)
-const checkInterval = 10 * 60 * 1000 // 10 minutes
-
-// Logging functions
-const ensureAppDataDirectory = async () => {
-    try {
-        await fs.mkdir(appDataDir, { recursive: true })
-    } catch (error) {
-        // Fallback to console if we can't create app data directory
-        console.error('Failed to create app data directory:', error)
-    }
-}
-
-const rotateLogFile = async (content) => {
-    const lines = content.split('\n').filter(Boolean)
-    if (lines.length > maxLogLines) {
-        const keptLines = lines.slice(-(maxLogLines - 1)) // Keep last 999 lines
-        return keptLines.join('\n') + '\n'
-    }
-    return content
-}
-
-const log = async (message) => {
-    const timestamp = new Date().toISOString()
-    const logMessage = `[${timestamp}] ${message}\n`
+/**
+ * Initialize winston logger
+ */
+const initializeLogger = () => {
+    logger = winston.createLogger({
+        level: 'info',
+        format: winston.format.combine(
+            winston.format.timestamp({
+                format: 'YYYY-MM-DD HH:mm:ss'
+            }),
+            winston.format.printf(({ timestamp, message }) => {
+                return `${timestamp} ${message}`
+            })
+        ),
+        transports: [
+            new winston.transports.Console({
+                format: winston.format.combine(
+                    winston.format.colorize(),
+                    winston.format.printf(({ timestamp, message }) => {
+                        return `${timestamp} ${message}`
+                    })
+                )
+            }),
+            new winston.transports.File({
+                filename: LOG_FILE,
+                maxsize: 1024 * 1024, // 1MB max file size
+                maxFiles: 1,
+                tailable: true
+            })
+        ]
+    })
     
-    try {
-        await ensureAppDataDirectory()
-        
-        // Read existing log content
-        let existingContent = ''
+    // Handle logger errors
+    logger.on('error', (error) => {
+        console.error('Logger error:', error)
+    })
+}
+
+/**
+ * Create necessary directories
+ */
+const createDirectories = async () => {
+    const directories = [APP_CONFIG_DIR, APP_LOG_DIR, DROPBOX_WALLPAPER_DIR]
+    
+    for (const dir of directories) {
         try {
-            existingContent = await fs.readFile(logFile, 'utf-8')
+            await fs.promises.mkdir(dir, { recursive: true })
         } catch (error) {
-            if (error.code !== 'ENOENT') {
-                console.error('Error reading log file:', error)
-            }
+            throw new Error(`Failed to create directory ${dir}: ${error.message}`)
+        }
+    }
+}
+
+/**
+ * Initialize configuration file
+ */
+const initializeConfig = async () => {
+    try {
+        await fs.promises.access(CONFIG_FILE)
+
+        // Config file exists, validate it
+        const configData = await fs.promises.readFile(CONFIG_FILE, 'utf8')
+        const config = JSON.parse(configData)
+        
+        if (!config.handledWallpapers || !Array.isArray(config.handledWallpapers)) {
+            throw new Error('Invalid config file format')
         }
         
-        // Rotate log if needed and append new message
-        const rotatedContent = await rotateLogFile(existingContent)
-        const newContent = rotatedContent + logMessage
-        
-        console.log(logMessage)
-        await fs.writeFile(logFile, newContent)
+        logger.info(`[info] Loaded config with ${config.handledWallpapers.length} handled wallpapers`)
     } catch (error) {
-        // Fallback to console if logging fails
-        console.error('Logging failed, falling back to console:', error)
-        await log(message)
+        if (error.code === 'ENOENT') {
+            const initialConfig = { handledWallpapers: [] }
+            await fs.promises.writeFile(CONFIG_FILE, JSON.stringify(initialConfig, null, 2))
+
+            logger.info('[info] Created new config file')
+        } else {
+            throw new Error(`Failed to initialize config: ${error.message}`)
+        }
     }
 }
 
-// Function to get the current GNOME wallpaper path
-const getCurrentWallpaper = async () => {
+/**
+ * Read configuration from file
+ */
+const readConfig = async () => {
     try {
-        const { stdout } = await runCommand("gsettings get org.gnome.desktop.background picture-uri")
-        // Remove quotes and file:// prefix from the URI
-        return stdout.trim().replace(/^'|'$/g, '').replace(/^file:\/\//, '')
+        const configData = await fs.promises.readFile(CONFIG_FILE, 'utf8')
+
+        return JSON.parse(configData)
     } catch (error) {
-        await log(`[error] Failed to get current wallpaper: ${error.message}`)
-        return null
+        logger.error(`[error] Failed to read config: ${error.message}`)
+
+        return {
+            handledWallpapers: []
+        }
     }
 }
 
-// Function to get all image files in Dropbox wallpaper directory
-const getDropboxImages = async () => {
+/**
+ * Write configuration to file
+ */
+const writeConfig = async (config) => {
     try {
-        await fs.mkdir(wallpaperDirectory, { recursive: true })
-        const files = await fs.readdir(wallpaperDirectory)
-        return files.filter(file => file.match(/\.(png|jpg|jpeg|bmp|webp)$/i))
+        await fs.promises.writeFile(CONFIG_FILE, JSON.stringify(config, null, 2))
     } catch (error) {
-        await log(`[error] Failed to read Dropbox wallpaper directory: ${error.message}`)
-        return []
-    }
-}
+        logger.error(`[error] Failed to write config: ${error.message}`)
 
-// Function to read the handled wallpapers list
-const getHandledWallpapers = async () => {
-    try {
-        const content = await fs.readFile(wallpaperListFile, 'utf-8')
-        return content.split('\n').map(line => line.trim()).filter(Boolean)
-    } catch (error) {
-        if (error.code === 'ENOENT') return [] // file doesn't exist yet
         throw error
     }
 }
 
-// Function to set wallpaper in GNOME
-const setWallpaper = async (imagePath) => {
-    const uri = `file://${imagePath}`
-    await log(`Setting wallpaper: ${imagePath}`)
-    await runCommand(`gsettings set org.gnome.desktop.background picture-uri '${uri}'`)
-    await runCommand(`gsettings set org.gnome.desktop.background picture-uri-dark '${uri}'`)
-    
-    // Track that this wallpaper was set by the script
-    await saveLastScriptWallpaper(imagePath)
+/**
+ * Check if a wallpaper has been handled
+ */
+const isWallpaperHandled = async (wallpaperName) => {
+    const config = await readConfig()
+
+    return config.handledWallpapers.includes(wallpaperName)
 }
 
-// Function to append handled wallpaper to the list
-const markWallpaperAsHandled = async (filename) => {
-    await fs.appendFile(wallpaperListFile, `${filename}\n`)
-    await log(`Marked as handled: ${filename}`)
-}
+/**
+ * Mark a wallpaper as handled
+ */
+const markWallpaperAsHandled = async (wallpaperName) => {
+    logger.info(`[info] Marking wallpaper as handled: ${wallpaperName}`)
 
-// Function to get the last wallpaper set by the script
-const getLastScriptWallpaper = async () => {
     try {
-        const content = await fs.readFile(stateFile, 'utf-8')
-        return content.trim()
+        const config = await readConfig()
+
+        if (!config.handledWallpapers.includes(wallpaperName)) {
+            config.handledWallpapers.push(wallpaperName)
+            await writeConfig(config)
+
+            logger.info(`[info] Marked wallpaper as handled: ${wallpaperName}`)
+        }
     } catch (error) {
-        if (error.code === 'ENOENT') return null // file doesn't exist yet
-        await log(`[error] Failed to read state file: ${error.message}`)
+        logger.error(`[error] Failed to mark wallpaper as handled: ${error.message}`)
+
+        throw error
+    }
+}
+
+/**
+ * Generate datetime string for wallpaper filename
+ */
+const generateDateTimeString = () => {
+    const now = new Date()
+    const year = now.getFullYear()
+    const month = String(now.getMonth() + 1).padStart(2, '0')
+    const day = String(now.getDate()).padStart(2, '0')
+    const hours = String(now.getHours()).padStart(2, '0')
+    const minutes = String(now.getMinutes()).padStart(2, '0')
+    const seconds = String(now.getSeconds()).padStart(2, '0')
+    
+    return `${year}-${month}-${day}T${hours}-${minutes}-${seconds}`
+}
+
+/**
+ * Parse datetime from wallpaper filename
+ */
+const parseDateTimeFromFilename = (filename) => {
+    const match = filename.match(/wallpaper-(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})$/)
+
+    if (!match) {
         return null
     }
-}
 
-// Function to save the last wallpaper set by the script
-const saveLastScriptWallpaper = async (wallpaperPath) => {
-    try {
-        await ensureAppDataDirectory()
-        await fs.writeFile(stateFile, wallpaperPath)
-        await log(`Saved script wallpaper state: ${path.basename(wallpaperPath)}`)
-    } catch (error) {
-        await log(`[error] Failed to save state file: ${error.message}`)
-    }
-}
+    const [_, year, month, day, hour, minute, second] = match
 
-// Function to check if current wallpaper was changed by user (not script)
-const isWallpaperChangedByUser = async (currentWallpaper) => {
-    const lastScriptWallpaper = await getLastScriptWallpaper()
-    
-    // If we have no record of script-set wallpaper, assume it's a user change
-    if (!lastScriptWallpaper) {
-        return true
-    }
-    
-    // If current wallpaper is different from what script last set, it's a user change
-    return currentWallpaper !== lastScriptWallpaper
-}
+    const date = new Date(
+        Number(year),
+        Number(month) - 1,
+        Number(day),
+        Number(hour),
+        Number(minute),
+        Number(second)
+    )
 
-// Function to copy current wallpaper to Dropbox directory
-const copyWallpaperToDropbox = async (sourcePath) => {
-    try {
-        const sourceExtension = path.extname(sourcePath)
-        const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
-        const newFilename = `wallpaper-${timestamp}${sourceExtension}`
-        const destinationPath = path.join(wallpaperDirectory, newFilename)
-        
-        // Ensure Dropbox directory exists
-        await fs.mkdir(wallpaperDirectory, { recursive: true })
-        
-        // Copy the file
-        await fs.copyFile(sourcePath, destinationPath)
-        await log(`Copied wallpaper to Dropbox: ${newFilename}`)
-        
-        return newFilename
-    } catch (error) {
-        console.error('Failed to copy wallpaper to Dropbox:', error)
+    if (isNaN(date.getTime())) {
         return null
     }
+
+    return date
 }
 
-// Function to check if wallpaper file exists in Dropbox directory
-const isWallpaperInDropbox = async (wallpaperPath) => {
-    const dropboxImages = await getDropboxImages()
-    const wallpaperFilename = path.basename(wallpaperPath)
-    
-    // Check if exact filename exists
-    if (dropboxImages.includes(wallpaperFilename)) {
-        return wallpaperFilename
+/**
+ * Debounce function calls
+ */
+const debounce = (key, fn, delay) => {
+    if (debounceTimeouts.has(key)) {
+        clearTimeout(debounceTimeouts.get(key))
     }
     
-    // Check if the actual file path points to Dropbox directory
-    if (wallpaperPath.startsWith(wallpaperDirectory)) {
-        return path.basename(wallpaperPath)
-    }
+    const timeout = setTimeout(() => {
+        debounceTimeouts.delete(key)
+        fn()
+    }, delay)
     
-    return null
+    debounceTimeouts.set(key, timeout)
 }
 
-// Main sync logic - handles both directions of sync
-const performWallpaperSync = async () => {
-    const currentWallpaper = await getCurrentWallpaper()
-    const handledWallpapers = await getHandledWallpapers()
-    
-    if (!currentWallpaper) {
-        await log('[error] Could not detect current wallpaper')
-        return
-    }
-
-    // Check if current wallpaper needs to be synced to Dropbox
-    await syncCurrentWallpaperToDropbox(currentWallpaper, handledWallpapers)
-    
-    // Check for new wallpapers from Dropbox to apply locally
-    await syncDropboxWallpapersToLocal(handledWallpapers)
-}
-
-// Sync current wallpaper to Dropbox if it's new AND was changed by user
-const syncCurrentWallpaperToDropbox = async (currentWallpaper, handledWallpapers) => {
-    const dropboxFilename = await isWallpaperInDropbox(currentWallpaper)
-    
-    if (dropboxFilename) {
-        // Wallpaper is already in Dropbox, check if it's marked as handled
-        if (!handledWallpapers.includes(dropboxFilename)) {
-            await markWallpaperAsHandled(dropboxFilename)
-            await log(`Current wallpaper marked as handled: ${dropboxFilename}`)
-        }
-    } else {
-        // Only sync to Dropbox if this wallpaper was changed by the user (not the script)
-        const isUserChange = await isWallpaperChangedByUser(currentWallpaper)
-        
-        if (isUserChange) {
-            // Wallpaper is not in Dropbox and was changed by user, copy it there
-            const newFilename = await copyWallpaperToDropbox(currentWallpaper)
-            if (newFilename) {
-                await markWallpaperAsHandled(newFilename)
-                await log(`User-changed wallpaper synced to Dropbox: ${newFilename}`)
-                
-                // Update our state to reflect that this wallpaper is now "known" to the script
-                await saveLastScriptWallpaper(currentWallpaper)
-            }
-        } else {
-            await log(`Skipping sync - wallpaper was set by script, not user: ${path.basename(currentWallpaper)}`)
-        }
-    }
-}
-
-// Check for new wallpapers in Dropbox and apply them locally
-const syncDropboxWallpapersToLocal = async (handledWallpapers) => {
-    const dropboxImages = await getDropboxImages()
-    const newImages = dropboxImages.filter(filename => !handledWallpapers.includes(filename))
-    
-    if (newImages.length > 0) {
-        // Apply the most recent new wallpaper
-        const newestWallpaper = newImages[newImages.length - 1]
-        const wallpaperPath = path.join(wallpaperDirectory, newestWallpaper)
-        
-        await setWallpaper(wallpaperPath)
-        await markWallpaperAsHandled(newestWallpaper)
-        
-        await log(`Applied new wallpaper from Dropbox: ${newestWallpaper}`)
-        
-        // Mark any other new wallpapers as handled too (to avoid conflicts)
-        for (const image of newImages.slice(0, -1)) {
-            await markWallpaperAsHandled(image)
-        }
-    }
-}
-
-// Main infinite loop
-const startWallpaperSync = async () => {
-    await log('Wallpaper sync started - monitoring for changes every 10 minutes')
-    await log(`Log file: ${logFile}`)
-    await log(`Dropbox wallpaper directory: ${wallpaperDirectory}`)
-    await log(`State file: ${stateFile}`)
-    
-    // Initialize state file with current wallpaper on first run
-    const currentWallpaper = await getCurrentWallpaper()
-    const lastScriptWallpaper = await getLastScriptWallpaper()
-    
-    if (!lastScriptWallpaper && currentWallpaper) {
-        await log(`Initializing state with current wallpaper: ${path.basename(currentWallpaper)}`)
-        await saveLastScriptWallpaper(currentWallpaper)
-    }
-    
-    while (true) {
+/**
+ * Copy file with error handling and retries
+ */
+const copyFileWithRetry = async (source, destination, maxRetries = 3) => {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-            await log(`Checking for wallpaper changes... ${new Date().toLocaleTimeString()}`)
-            await performWallpaperSync()
+            await fs.promises.copyFile(source, destination)
+            
+            return true
         } catch (error) {
-            console.error('Error during sync:', error)
+            logger.warn(`[warn] Copy attempt ${attempt} failed: ${error.message}`)
+
+            if (attempt === maxRetries) {
+                throw error
+            }
+
+            // Wait before retry
+            await new Promise(resolve => setTimeout(resolve, 1000 * attempt))
+        }
+    }
+    return false
+}
+
+/**
+ * Handle GNOME wallpaper change
+ */
+const handleWallpaperChange = async () => {
+    try {
+        logger.info('[info] Detected wallpaper change, processing...')
+        
+        // Check if background file exists
+        try {
+            await fs.promises.access(GNOME_BACKGROUND_FILE)
+        } catch {
+            logger.warn('[warn] Background file does not exist, skipping')
+            return
         }
         
-        await log(`Sleeping for 10 minutes...`)
-        await new Promise(resolve => setTimeout(resolve, checkInterval))
+        // Generate wallpaper filename with current datetime
+        const dateTimeString = generateDateTimeString()
+        const wallpaperName = `wallpaper-${dateTimeString}`
+        const destinationPath = path.join(DROPBOX_WALLPAPER_DIR, wallpaperName)
+        
+        // Mark as handled BEFORE copying to avoid loop
+        await markWallpaperAsHandled(wallpaperName)
+        
+        // Copy wallpaper to Dropbox
+        await copyFileWithRetry(GNOME_BACKGROUND_FILE, destinationPath)
+        
+        logger.info(`[info] Successfully copied wallpaper to Dropbox: ${wallpaperName}`)
+    } catch (error) {
+        logger.error(`[error] Failed to handle wallpaper change: ${error.message}`)
     }
 }
 
-startWallpaperSync()
+/**
+ * Start GNOME wallpaper watcher
+ */
+const startGnomeWatcher = () => {
+    logger.info('[info] Starting GNOME wallpaper watcher')
+    
+    const watcher = chokidar.watch(GNOME_CONFIG_DIR, {
+        ignoreInitial: true,
+        atomic: true,
+        awaitWriteFinish: {
+            stabilityThreshold: 1000,
+            pollInterval: 100
+        }
+    })
+    
+    watcher.on('add', (filePath) => {
+        if (path.basename(filePath) === 'background') {
+            logger.info('[info] New background file detected')
+            debounce('gnome-wallpaper', handleWallpaperChange, DEBOUNCE_DELAY)
+        }
+    })
+    
+    watcher.on('change', (filePath) => {
+        if (path.basename(filePath) === 'background') {
+            logger.info('[info] Background file changed')
+            debounce('gnome-wallpaper', handleWallpaperChange, DEBOUNCE_DELAY)
+        }
+    })
+    
+    watcher.on('error', (error) => {
+        logger.error(`[error] GNOME watcher error: ${error.message}`)
+    })
+    
+    return watcher
+}
 
+/**
+ * Execute gsettings command to set wallpaper
+ */
+const setGnomeWallpaper = async (wallpaperPath) => {
+    logger.info(`[info] Changing wallpaper to: ${wallpaperPath}`)
+
+    return new Promise((resolve, reject) => {
+        const fileUri = `file://${wallpaperPath}`
+        
+        // Set both light and dark wallpapers
+        const commands = [
+            ['gsettings', 'set', 'org.gnome.desktop.background', 'picture-uri', fileUri],
+            ['gsettings', 'set', 'org.gnome.desktop.background', 'picture-uri-dark', fileUri]
+        ]
+        
+        let completed = 0
+        let hasError = false
+        
+        commands.forEach(command => {
+            const process = spawn(command[0], command.slice(1))
+            
+            process.on('error', (error) => {
+                if (!hasError) {
+                    hasError = true
+                    reject(new Error(`Failed to execute ${command.join(' ')}: ${error.message}`))
+                }
+            })
+            
+            process.on('close', (code) => {
+                if (code !== 0 && !hasError) {
+                    hasError = true
+                    reject(new Error(`Command ${command.join(' ')} exited with code ${code}`))
+                    return
+                }
+                
+                completed++
+
+                if (completed === commands.length && !hasError) {
+                    resolve()
+                }
+            })
+        })
+    })
+}
+
+/**
+ * Get newest wallpaper from Dropbox directory
+ */
+const getNewestWallpaper = async () => {
+    try {
+        const files = await fs.promises.readdir(DROPBOX_WALLPAPER_DIR)
+
+        const wallpaperFiles = files
+            .filter(file => /^wallpaper-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}$/.test(file))
+            .map(file => ({
+                name: file,
+                path: path.join(DROPBOX_WALLPAPER_DIR, file),
+                date: parseDateTimeFromFilename(file)
+            }))
+            .filter(file => file.date !== null)
+            .sort((a, b) => b.date - a.date)
+
+        logger.info(`[info] Wallpaper files sorted by date: ${JSON.stringify(wallpaperFiles)}`)
+        
+        return wallpaperFiles.length > 0 ? wallpaperFiles[0] : null
+    } catch (error) {
+        logger.error(`[error] Failed to read Dropbox wallpaper directory: ${error.message}`)
+
+        return null
+    }
+}
+
+/**
+ * Handle Dropbox wallpaper change
+ */
+const handleDropboxWallpaperChange = async () => {
+    try {
+        logger.info('[info] Checking for new wallpapers in Dropbox...')
+        
+        const newestWallpaper = await getNewestWallpaper()
+
+        if (!newestWallpaper) {
+            logger.info('[info] No wallpapers found in Dropbox')
+
+            return
+        }
+        
+        logger.info(`[info] Newest wallpaper: ${newestWallpaper.name}`)
+        
+        // Check if already handled
+        if (await isWallpaperHandled(newestWallpaper.name)) {
+            logger.info('[info] Wallpaper already handled, skipping')
+
+            return
+        }
+        
+        // Verify file exists
+        try {
+            await fs.promises.access(newestWallpaper.path)
+        } catch {
+            logger.warn(`[warn] Wallpaper file does not exist: ${newestWallpaper.path}`)
+
+            return
+        }
+        
+        // Set as GNOME wallpaper
+        await setGnomeWallpaper(newestWallpaper.path)
+        
+        // Mark as handled
+        await markWallpaperAsHandled(newestWallpaper.name)
+        
+        logger.info(`[info] Successfully set new wallpaper: ${newestWallpaper.name}`)
+    } catch (error) {
+        logger.error(`[error] Failed to handle Dropbox wallpaper change: ${error.message}`)
+    }
+}
+
+/**
+ * Start Dropbox wallpaper watcher
+ */
+const startDropboxWatcher = () => {
+    logger.info('[info] Starting Dropbox wallpaper watcher')
+    
+    const watcher = chokidar.watch(DROPBOX_WALLPAPER_DIR, {
+        ignoreInitial: true,
+        atomic: true,
+        awaitWriteFinish: {
+            stabilityThreshold: 2000,
+            pollInterval: 100
+        }
+    })
+    
+    watcher.on('add', (filePath) => {
+        logger.info(`[info] Chokidar Dropbox watcher! New file: ${filePath}`)
+
+        const filename = path.basename(filePath)
+
+        if (/^wallpaper-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}$/.test(filename)) {
+            logger.info(`[info] New wallpaper detected in Dropbox: ${filename}`)
+            debounce('dropbox-wallpaper', handleDropboxWallpaperChange, DEBOUNCE_DELAY)
+        }
+    })
+    
+    watcher.on('change', (filePath) => {
+        const filename = path.basename(filePath)
+
+        if (/^wallpaper-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}$/.test(filename)) {
+            logger.info(`[info] Wallpaper changed in Dropbox: ${filename}`)
+            debounce('dropbox-wallpaper', handleDropboxWallpaperChange, DEBOUNCE_DELAY)
+        }
+    })
+    
+    watcher.on('error', (error) => {
+        logger.error(`[error] Dropbox watcher error: ${error.message}`)
+    })
+    
+    return watcher
+}
+
+/**
+ * Start all watchers
+ */
+const startWatchers = () => {
+    const gnomeWatcher = startGnomeWatcher()
+    const dropboxWatcher = startDropboxWatcher()
+    
+    process.on('exit', () => {
+        gnomeWatcher.close()
+        dropboxWatcher.close()
+    })
+}
+
+/**
+ * Perform startup sync to handle wallpapers that appeared while app was offline
+ */
+const performStartupSync = async () => {
+    try {
+        logger.info('[info] Performing startup sync...')
+        
+        // Handle any unhandled wallpapers
+        await handleDropboxWallpaperChange()
+        
+        logger.info('[info] Startup sync completed')
+    } catch (error) {
+        logger.error(`[error] Startup sync failed: ${error.message}`)
+    }
+}
+
+/**
+ * Initialize the application
+ */
+const initializeApp = async () => {
+    try {
+        await createDirectories()
+        initializeLogger()
+        await initializeConfig()
+        
+        logger.info('[info] Wallpaper Sync starting up')
+        logger.info(`[info] Config directory: ${APP_CONFIG_DIR}`)
+        logger.info(`[info] Log directory: ${APP_LOG_DIR}`)
+        logger.info(`[info] Dropbox wallpaper directory: ${DROPBOX_WALLPAPER_DIR}`)
+        
+        await performStartupSync()
+        startWatchers()
+        
+        logger.info('[info] Wallpaper Sync is now running')
+        
+    } catch (error) {
+        console.error('[error] Failed to initialize application:', error.message)
+        process.exit(1)
+    }
+}
+
+/**
+ * Main
+ */
+initializeApp().catch(error => {
+    console.error('[error] Unhandled error:', error)
+    process.exit(1)
+})
+
+process.on('SIGINT', () => {
+    if (logger) {
+        logger.info('[exit] Shutting down Wallpaper Sync')
+    }
+    process.exit(0)
+})
+
+process.on('SIGTERM', () => {
+    if (logger) {
+        logger.info('[exit] Shutting down Wallpaper Sync')
+    }
+    process.exit(0)
+})
